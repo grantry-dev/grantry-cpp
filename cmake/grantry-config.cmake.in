@@ -1,0 +1,13 @@
+@PACKAGE_INIT@
+
+# grantry is a static library, so whoever links it also links what it links.
+# On Windows that is in-box system libraries only, named by the exported
+# target. Elsewhere it is libcurl and OpenSSL's libcrypto, found here.
+include(CMakeFindDependencyMacro)
+if(NOT WIN32)
+    find_dependency(CURL)
+    find_dependency(OpenSSL)
+endif()
+
+include("${CMAKE_CURRENT_LIST_DIR}/grantry-targets.cmake")
+check_required_components(grantry)
