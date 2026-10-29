@@ -417,9 +417,11 @@ class ClientImpl : public Client, public std::enable_shared_from_this<ClientImpl
      */
     std::weak_ptr<ClientImpl> self = weak_from_this();
     const bool started_requiring = requires_plan();
+    const bool started_with_session = has_session();
     std::thread thread;
-    if (!StartThread(thread, [self, watch, on_change = std::move(on_change), started_requiring] {
-          RunPlanWatch(self, watch, on_change, started_requiring);
+    if (!StartThread(thread, [self, watch, on_change = std::move(on_change), started_requiring,
+                              started_with_session] {
+          RunPlanWatch(self, watch, on_change, started_requiring, started_with_session);
         })) {
       // Nothing is watching, so nothing may look as if it were.
       std::lock_guard<std::mutex> lock(mutex_);
@@ -1332,8 +1334,6 @@ class ClientImpl : public Client, public std::enable_shared_from_this<ClientImpl
       return result;
     }
 
-    Subscription subscription;
-
     /*
      * ⚠️ NULL IS THE ORDINARY ANSWER, NOT AN ERROR. Somebody on the
      * environment's default free plan has no subscription row at all, and a
@@ -1341,32 +1341,69 @@ class ClientImpl : public Client, public std::enable_shared_from_this<ClientImpl
      * screen to every free user.
      */
     const internal::Json* entry = document.Find("subscription");
-    if (entry != nullptr && entry->is_object()) {
-      subscription.active = true;
-      subscription.plan_key = entry->GetString("planKey").value_or(std::string());
-      subscription.plan_name = entry->GetString("planName").value_or(std::string());
-      subscription.status = entry->GetString("status").value_or(std::string());
-      subscription.cancel_at_period_end = entry->GetBool("cancelAtPeriodEnd");
+    result.value = entry != nullptr && entry->is_object() ? ReadSubscription(*entry) : Subscription();
+    return result;
+  }
 
-      /*
-       * ⚠️ ABSENT FOR A LIFETIME, AND LEFT ABSENT. The server sends null
-       * because there is no end; substituting anything here would hand every
-       * countdown a date to subtract from.
-       */
-      subscription.current_period_end =
-          entry->GetString("currentPeriodEnd").value_or(std::string());
+  Result<std::vector<Subscription>> GetSubscriptions() override {
+    Result<std::vector<Subscription>> result;
 
-      const internal::Json* interval = entry->Find("interval");
-      if (interval != nullptr && interval->is_object()) {
-        subscription.interval_unit =
-            interval->GetString("unit").value_or(std::string());
-        subscription.interval_count =
-            static_cast<int>(interval->GetInt("count").value_or(1));
-      }
+    internal::HttpResponse response;
+    Error error = Send("GET", "/v1/client/billing/me", std::string(), response);
+    if (error) {
+      result.error = error;
+      return result;
     }
 
-    result.value = subscription;
+    internal::Json document;
+    if (!internal::Json::Parse(response.body, document)) {
+      result.error = MakeError(ErrorKind::kApi, "The billing response was not JSON.");
+      return result;
+    }
+
+    /*
+     * `held`, every plan held in the server's order. A server older than the
+     * list sends only `subscription`, which is then the one entry.
+     */
+    std::vector<Subscription> list;
+    const internal::Json* held = document.Find("held");
+    if (held != nullptr && held->is_array()) {
+      for (const internal::Json& item : held->array) {
+        if (item.is_object()) list.push_back(ReadSubscription(item));
+      }
+    } else {
+      const internal::Json* entry = document.Find("subscription");
+      if (entry != nullptr && entry->is_object()) list.push_back(ReadSubscription(*entry));
+    }
+    result.value = std::move(list);
     return result;
+  }
+
+  /// One entry of `billing/me`: `subscription`, or a row of `held`.
+  static Subscription ReadSubscription(const internal::Json& entry) {
+    Subscription subscription;
+    subscription.active = true;
+    subscription.plan_key = entry.GetString("planKey").value_or(std::string());
+    subscription.plan_name = entry.GetString("planName").value_or(std::string());
+    subscription.status = entry.GetString("status").value_or(std::string());
+    subscription.cancel_at_period_end = entry.GetBool("cancelAtPeriodEnd");
+
+    /*
+     * ⚠️ ABSENT FOR A LIFETIME, AND LEFT ABSENT. The server sends null
+     * because there is no end; substituting anything here would hand every
+     * countdown a date to subtract from.
+     */
+    subscription.current_period_end =
+        entry.GetString("currentPeriodEnd").value_or(std::string());
+    std::optional<std::int64_t> days = entry.GetInt("expiresInDays");
+    if (days) subscription.expires_in_days = static_cast<int>(*days);
+
+    const internal::Json* interval = entry.Find("interval");
+    if (interval != nullptr && interval->is_object()) {
+      subscription.interval_unit = interval->GetString("unit").value_or(std::string());
+      subscription.interval_count = static_cast<int>(interval->GetInt("count").value_or(1));
+    }
+    return subscription;
   }
 
   Result<std::vector<Plan>> GetPlans() override {
@@ -2970,10 +3007,25 @@ class ClientImpl : public Client, public std::enable_shared_from_this<ClientImpl
   }
 
   static void RunPlanWatch(std::weak_ptr<ClientImpl> self, std::shared_ptr<PlanWatch> watch,
-                           std::function<void()> on_change, bool started_requiring) {
+                           std::function<void()> on_change, bool started_requiring,
+                           bool started_with_session) {
     std::string version;
     bool baseline = true;
     int failures = 0;
+    /*
+     * ⚠️ A SESSION THAT BEGAN AFTER THE WATCH IS TOLD ON ITS FIRST ANSWER, WHATEVER IT SAYS
+     * (18 October 2026). The baseline compares with `started_requiring`, which is how things stood
+     * when the watch began — and an application that watches from launch began it signed out. A
+     * person then signed in with no plan, was shown so, and a licence the merchant's sign-up
+     * webhook moved across landed before this loop's first poll: the fresh mint said "no plan
+     * required", the same as at launch, and nobody was told. The loop cannot know what the
+     * application was shown between that sign-in and now — a session is adopted from a response
+     * header and `requires_plan()` only by the next mint — so it asks the application to look
+     * again. A callback with nothing changed costs a redraw; a lost one left Superino's window on
+     * "no plan" with the plan held.
+     */
+    bool watching_session = started_with_session;
+    bool tell_on_baseline = false;
 
     while (!StoppedAfter(watch, 0)) {
       int pause_seconds = 1;  // a floor, so nothing the server answers can make this spin
@@ -2983,9 +3035,21 @@ class ClientImpl : public Client, public std::enable_shared_from_this<ClientImpl
         if (!client) return;
 
         if (!client->has_session()) {
-          // Signed out: nothing to watch until somebody signs in, and nothing to ask meanwhile.
-          pause_seconds = 30;
+          /*
+           * Signed out: nothing to watch until somebody signs in. A second, not thirty: this asks
+           * nothing of the server, only whether this object holds a session, and thirty seconds of
+           * not looking was thirty seconds a sign-in's plan could go unannounced.
+           */
+          watching_session = false;
+          pause_seconds = 1;
         } else {
+          if (!watching_session) {
+            // A session this watch has not seen: its first answer is a baseline of its own.
+            watching_session = true;
+            baseline = true;
+            version.clear();
+            tell_on_baseline = true;
+          }
           internal::HttpResponse response;
           Error error = client->Send("GET", "/v1/client/entitlements/changes?since=" + PercentEncode(version),
                                      std::string(), response, std::string(), false, std::string(),
@@ -3008,9 +3072,11 @@ class ClientImpl : public Client, public std::enable_shared_from_this<ClientImpl
                 // Mint afresh first, so the callback finds requires_plan() and the identity agreeing.
                 client->ForgetIdentity();
                 (void)client->GetIdentity();
-                notify = baseline ? client->requires_plan() != started_requiring : true;
+                notify = baseline ? tell_on_baseline || client->requires_plan() != started_requiring
+                                  : true;
               }
               baseline = false;
+              tell_on_baseline = false;
             }
           }
         }
@@ -3311,7 +3377,7 @@ Result<std::shared_ptr<Client>> Client::Create(Options options) {
  * sources without the CMake file; keep it equal to that line.
  */
 #ifndef GRANTRY_VERSION
-#define GRANTRY_VERSION "0.1.0"
+#define GRANTRY_VERSION "0.1.1"
 #endif
 
 const char* Version() { return GRANTRY_VERSION; }

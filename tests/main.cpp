@@ -3331,6 +3331,18 @@ class AccountApi {
       reply.body.clear();
       return reply;
     }
+    // Two products held at once, the lifetime first, as the server orders them.
+    if (request.path == "/v1/client/billing/me") {
+      reply.body =
+          "{\"subscription\":{\"planKey\":\"permanent\",\"planName\":\"Permanent\",\"status\":\"active\","
+          "\"interval\":{\"unit\":\"lifetime\",\"count\":1},\"currentPeriodEnd\":null,\"expiresInDays\":null},"
+          "\"held\":[{\"planKey\":\"permanent\",\"planName\":\"Permanent\",\"status\":\"active\","
+          "\"interval\":{\"unit\":\"lifetime\",\"count\":1},\"currentPeriodEnd\":null,\"expiresInDays\":null},"
+          "{\"planKey\":\"cleaner\",\"planName\":\"Cleaner\",\"status\":\"active\","
+          "\"interval\":{\"unit\":\"day\",\"count\":30},\"currentPeriodEnd\":\"2026-11-12T10:00:00.000Z\","
+          "\"expiresInDays\":14}]}";
+      return reply;
+    }
     if (request.path == "/v1/client/account/devices") {
       reply.body = "{\"data\":["
                    "{\"id\":\"dev_this\",\"label\":\"E0B4902D\",\"platform\":\"windows\","
@@ -3428,6 +3440,23 @@ void TestAccountProofs() {
     CHECK(!(*devices)[1].current);
     CHECK((*devices)[1].platform == "macos");
   }
+
+  /*
+   * Every plan held, each with its own days left (29 October 2026): "Cleaner"'s expiry is read by
+   * its key, never from whichever plan `GetSubscription` happens to name.
+   */
+  Result<std::vector<grantry::Subscription>> held = client->GetSubscriptions();
+  CHECK(held.ok() && held->size() == 2);
+  if (held.ok() && held->size() == 2) {
+    CHECK((*held)[0].plan_key == "permanent");
+    CHECK(!(*held)[0].expires_in_days.has_value());
+    CHECK((*held)[0].current_period_end.empty());
+    CHECK((*held)[1].plan_key == "cleaner");
+    CHECK((*held)[1].expires_in_days == std::optional<int>(14));
+    CHECK((*held)[1].interval_count == 30);
+  }
+  Result<grantry::Subscription> first = client->GetSubscription();
+  CHECK(first.ok() && first->active && first->plan_key == "permanent");
 
   // Deleted with an authenticator code — last, since it signs the client out.
   CHECK(client->DeleteAccount(Proof::AuthenticatorCode("123456")).ok());
@@ -3561,6 +3590,51 @@ void TestWatchPlans() {
   client->StopWatchingPlans();
   api.set_plans_version("v3");
   CHECK(!wait_until([&] { return heard >= 2; }, 3));
+}
+
+/*
+ * ⚠️ WATCHING FROM LAUNCH, SIGNING IN LATER (18 October 2026). An application starts the watch
+ * before anybody has signed in, the way Superino's window does. Somebody signs in with no plan and
+ * is shown so; a licence moved across by the merchant's sign-up webhook lands before the watch's
+ * first poll for that session. That first answer was a baseline compared with how things stood at
+ * LAUNCH — signed out, so "requires no plan" — and the fresh mint said the same, so nobody was told
+ * and the window sat on "no plan". The watch also slept 30 seconds at a time while signed out.
+ */
+void TestWatchPlansSignInAfterStart() {
+  Section("watching from launch, signing in later");
+
+  AccountApi api;
+  std::shared_ptr<grantry::Client> client = AccountClient(api);
+  CHECK(client != nullptr);
+  if (!client) return;
+
+  std::mutex heard_mutex;
+  std::condition_variable heard_cv;
+  int heard = 0;
+  bool requiring_when_heard = true;
+  client->WatchPlans([&] {
+    std::lock_guard<std::mutex> lock(heard_mutex);
+    ++heard;
+    requiring_when_heard = client->requires_plan();
+    heard_cv.notify_all();
+  });
+
+  // Signed in with no plan, and shown so.
+  api.set_requires_plan(true);
+  CHECK(client->SignIn("ada@example.test", "hunter2hunter2").ok());
+  CHECK(client->GetIdentity().ok());
+  CHECK(client->requires_plan());
+
+  // The licence lands at once, before the watch has asked anything about this session.
+  api.set_requires_plan(false);
+  api.set_plans_version("granted");
+
+  std::unique_lock<std::mutex> lock(heard_mutex);
+  CHECK(heard_cv.wait_for(lock, std::chrono::seconds(10), [&] { return heard >= 1; }));
+  CHECK(!requiring_when_heard);
+  lock.unlock();
+  CHECK(!client->requires_plan());
+  client->StopWatchingPlans();
 }
 
 void TestSignUpAcceptedLegal() {
@@ -4010,6 +4084,7 @@ int main() {
   TestIdentityFollowsTheAccount();
   TestRequiresPlanFromTheMint();
   TestWatchPlans();
+  TestWatchPlansSignInAfterStart();
   TestSignUpAcceptedLegal();
   TestBodyCeiling();
   TestDeviceFallback();

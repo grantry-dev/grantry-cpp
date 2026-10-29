@@ -957,6 +957,11 @@ struct Subscription {
   /// than one written here would be.
   std::string current_period_end;
 
+  /// Whole days until `current_period_end`, rounded up, so the last day reads
+  /// 1; nullopt for a lifetime. Counted on the server's clock, so a machine
+  /// whose own clock is wrong still shows the right number.
+  std::optional<int> expires_in_days;
+
   /// Whether it is set to stop at the end of the current period.
   bool cancel_at_period_end = false;
 };
@@ -1379,6 +1384,14 @@ class Client {
   /// The first answer is a baseline, not a change: `on_change` runs for it
   /// only if `requires_plan()` moved between this call and that answer, so a
   /// plan that arrived while the application was starting is not lost.
+  ///
+  /// ⚠️ A SESSION THAT BEGINS AFTER THIS CALL GETS A CALLBACK ON ITS FIRST
+  /// ANSWER, changed or not. Watching from launch and signing in later is the
+  /// ordinary shape of a desktop application, and a plan granted during that
+  /// sign-in (a licence moved across by a sign-up webhook, a checkout
+  /// finishing) must reach the window that just showed "no plan". Treat
+  /// `on_change` as "read the plan again", which it always was. A signed-out
+  /// watch looks for a session every second and asks the server nothing.
   ///
   /// Calling it again replaces the watch. Errors back off, up to a minute
   /// between attempts, and honour a 429's `Retry-After`; nothing is reported,
@@ -1856,6 +1869,21 @@ class Client {
   ///
   /// `active == false` is the ordinary answer for somebody on the free plan.
   virtual Result<Subscription> GetSubscription() = 0;
+
+  /// Every plan the signed-in user holds, each with its own end and days left:
+  /// the one ending last first, a lifetime before anything with a date.
+  ///
+  /// ⚠️ ASK THIS, NOT `GetSubscription`, WHEN SOMEBODY CAN HOLD MORE THAN ONE.
+  /// Under one-time purchases a person may own "Permanent" and "Cleaner" at
+  /// once; `GetSubscription` is only the first of them, so the expiry of the
+  /// one this program sells is found by its key here:
+  ///
+  ///     for (const auto& held : client->GetSubscriptions().value)
+  ///       if (held.plan_key == "cleaner") days = held.expires_in_days;
+  ///
+  /// Empty is the ordinary answer for somebody on the free plan. For showing,
+  /// not for deciding, as `GetSubscription` is.
+  virtual Result<std::vector<Subscription>> GetSubscriptions() = 0;
 
   /// The plans a user could subscribe to, with their prices.
   ///
