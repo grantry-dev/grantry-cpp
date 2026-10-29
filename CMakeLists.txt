@@ -153,7 +153,7 @@ endif()
 #
 # find_package(grantry CONFIG) support:
 #
-#   find_package(grantry 0.1 CONFIG REQUIRED)
+#   find_package(grantry 0.2 CONFIG REQUIRED)
 #   target_link_libraries(your_app PRIVATE grantry::grantry)
 #
 # ⚠️ SameMinorVersion WHILE THE MAJOR IS ZERO. Before 1.0 a minor release may

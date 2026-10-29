@@ -65,7 +65,7 @@ cmake --install build --prefix /opt/grantry
 ```
 
 ```cmake
-find_package(grantry 0.1 CONFIG REQUIRED)   # -DCMAKE_PREFIX_PATH=/opt/grantry
+find_package(grantry 0.2 CONFIG REQUIRED)   # -DCMAKE_PREFIX_PATH=/opt/grantry
 target_link_libraries(your_app PRIVATE grantry::grantry)
 ```
 
