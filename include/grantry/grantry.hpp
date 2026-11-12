@@ -1862,6 +1862,25 @@ class Client {
   /// minute rather than whenever the process restarts.
   virtual Result<Identity> GetIdentity() = 0;
 
+  /// Verify an access token this process did not mint itself — one handed
+  /// over by another program, typically the signed-in application that
+  /// started this one.
+  ///
+  /// The same offline checks GetIdentity runs: signature against the JWKS,
+  /// algorithm, issuer, audience (this client's environment, from its key),
+  /// expiry and the sixty-second lifetime. Needs no session, and makes no call
+  /// beyond fetching the JWKS when it is not cached.
+  ///
+  /// ⚠️ THERE IS NO NONCE TO CHECK, because this process did not ask for the
+  /// token. What stands in for it is the one-minute lifetime and the channel:
+  /// pass the token over a pipe or stdin, never on the command line or in an
+  /// environment variable, which other processes on the machine can read.
+  ///
+  /// ⚠️ OFFLINE MEANS IT CANNOT SEE A REVOCATION. A session signed out a few
+  /// seconds ago still verifies until the token expires. Within that minute
+  /// that is the design; for anything longer, ask the parent for a new token.
+  virtual Result<Identity> VerifyAccessToken(const std::string& access_token) = 0;
+
   /// What the signed-in user is currently paying for, if anything.
   ///
   /// ⚠️ FOR SHOWING, NOT FOR DECIDING. See `Subscription`: the gate is the

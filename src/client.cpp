@@ -1214,6 +1214,16 @@ class ClientImpl : public Client, public std::enable_shared_from_this<ClientImpl
     return status;
   }
 
+  Result<Identity> VerifyAccessToken(const std::string& access_token) override {
+    /*
+     * ⚠️ THE AUDIENCE IS THIS CLIENT'S CONFIGURED ENVIRONMENT, as in GetIdentity:
+     * a token for another environment, however genuinely signed, is refused.
+     * The empty nonce skips only the replay binding, which a token minted by
+     * another process cannot carry for this one.
+     */
+    return verifier_.Verify(access_token, options_.environment_id, std::string());
+  }
+
   Result<Identity> GetIdentity() override {
     Result<Identity> result;
 
@@ -3377,7 +3387,7 @@ Result<std::shared_ptr<Client>> Client::Create(Options options) {
  * sources without the CMake file; keep it equal to that line.
  */
 #ifndef GRANTRY_VERSION
-#define GRANTRY_VERSION "0.1.1"
+#define GRANTRY_VERSION "0.3.0"
 #endif
 
 const char* Version() { return GRANTRY_VERSION; }

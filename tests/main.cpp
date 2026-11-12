@@ -3499,6 +3499,64 @@ void TestIdentityFollowsTheAccount() {
  * result said so; a restore signs nobody in, and it mints, so the mint reports it beside the token
  * and the client keeps the last answer. Each mint replaces it, and signing out clears it.
  */
+/*
+ * ⚠️ A TOKEN HANDED OVER BY ANOTHER PROGRAM (12 November 2026): a signed-in launcher passes its
+ * access token to a helper it starts, and the helper — a client with no session of its own —
+ * verifies it. The audience is still the helper's own environment, so a genuine token for another
+ * one is refused, and a token altered on the way does not verify.
+ */
+void TestVerifyAccessToken() {
+  Section("a token handed over");
+
+  AccountApi api;
+  std::shared_ptr<grantry::Client> launcher = AccountClient(api);
+  std::shared_ptr<grantry::Client> worker = AccountClient(api);
+  CHECK(launcher != nullptr && worker != nullptr);
+  if (!launcher || !worker) return;
+  CHECK(launcher->SignIn("ada@example.test", "hunter2hunter2").ok());
+
+  Result<Identity> minted = launcher->GetIdentity();
+  CHECK(minted.ok());
+  if (!minted.ok()) return;
+
+  Result<Identity> handed = worker->VerifyAccessToken(minted->access_token());
+  CHECK(handed.ok());
+  if (handed.ok()) {
+    CHECK(handed->user_id() == minted->user_id());
+    CHECK(handed->session_id() == minted->session_id());
+    CHECK(handed->environment_id() == kEnvironment);
+  }
+  // Verifying is not signing in: the worker holds no session afterwards.
+  CHECK(!worker->has_session());
+
+  // A worker built for another environment refuses the same, genuinely signed, token.
+  grantry::Options elsewhere;
+  elsewhere.publishable_key = "pk_test_abcdefghijklmnop";
+  elsewhere.environment_id = "env_someone_elses_app";
+  elsewhere.api_base_url = api.url();
+  elsewhere.allow_insecure_loopback = true;
+  elsewhere.connect_on_start = false;
+  elsewhere.session_store = grantry::MakeInMemorySessionStore();
+  Result<std::shared_ptr<grantry::Client>> other = grantry::Client::Create(elsewhere);
+  CHECK(other.ok());
+  if (other.ok()) {
+    Result<Identity> refused = (*other.value)->VerifyAccessToken(minted->access_token());
+    CHECK(!refused.ok());
+    CHECK(refused.error.verification == VerificationFailure::kWrongAudience);
+  }
+
+  // One character of the signature changed on the way.
+  std::string altered = minted->access_token();
+  // Well inside the signature: the final character carries base64 padding bits.
+  char& changed = altered[altered.size() - 10];
+  changed = changed == 'A' ? 'B' : 'A';
+  Result<Identity> tampered = worker->VerifyAccessToken(altered);
+  CHECK(!tampered.ok());
+  CHECK(tampered.error.kind == grantry::ErrorKind::kVerification);
+
+  CHECK(!worker->VerifyAccessToken("not-a-token").ok());
+}
+
 void TestRequiresPlanFromTheMint() {
   Section("the plan report on a mint");
 
@@ -4082,6 +4140,7 @@ int main() {
   TestTrustedDevice();
   TestAccountProofs();
   TestIdentityFollowsTheAccount();
+  TestVerifyAccessToken();
   TestRequiresPlanFromTheMint();
   TestWatchPlans();
   TestWatchPlansSignInAfterStart();

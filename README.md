@@ -65,7 +65,7 @@ cmake --install build --prefix /opt/grantry
 ```
 
 ```cmake
-find_package(grantry 0.2 CONFIG REQUIRED)   # -DCMAKE_PREFIX_PATH=/opt/grantry
+find_package(grantry 0.3 CONFIG REQUIRED)   # -DCMAKE_PREFIX_PATH=/opt/grantry
 target_link_libraries(your_app PRIVATE grantry::grantry)
 ```
 
@@ -205,6 +205,26 @@ patched binary in it.
 
 If the paid feature *is* data, fetch it with the token above rather than
 shipping it and unlocking it.
+
+### Hand the user to a helper program
+
+A signed-in application that starts a second program (a background task or a
+worker) can pass the access token over and let the helper check it:
+
+```cpp
+// The signed-in application: a fresh token per job, written to the helper's stdin.
+pipe.Write(client->GetIdentity()->access_token());
+
+// The helper: same publishable key, no session, no sign-in.
+grantry::Result<grantry::Identity> identity = helper_client->VerifyAccessToken(token);
+if (!identity.ok()) return 1;
+```
+
+`VerifyAccessToken` runs the offline checks below, except the nonce, which only
+the process that asked for a token can hold. Pass the token over a pipe or
+stdin, never on the command line or in the environment, which other processes
+can read. The token lives a minute, so long work asks the application for a new
+one. The helper never needs the session itself.
 
 ---
 
